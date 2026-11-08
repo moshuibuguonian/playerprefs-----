@@ -2,142 +2,982 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
-using UnityEditor;
-using UnityEditor.Experimental.GraphView;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
-class PlayerPrefsDataMgr
+/// <summary>
+/// 仅使用 PlayerPrefs 保存对象数据。
+/// 支持 int、float、string、bool、enum、一维数组、List 接口/List 实现、
+/// 泛型 Dictionary、自定义可序列化对象以及 null。
+/// </summary>
+public sealed class PlayerPrefsDataMgr
 {
-    private static PlayerPrefsDataMgr instance = new PlayerPrefsDataMgr();
+    private const int MaxDepth = 64;
+    private const int MaxCollectionLength = 100000;
+    // '$' 和 '[' 不能出现在普通 C# 字段名中，避免与业务字段键冲突。
+    private const string CountSuffix = "$count";
+    private const string NullSuffix = "$null";
+    private const string ObjectSuffix = "$object";
+
+    private static readonly PlayerPrefsDataMgr InstanceValue =
+        new PlayerPrefsDataMgr();
+
+    private static readonly Dictionary<Type, FieldInfo[]> FieldCache =
+        new Dictionary<Type, FieldInfo[]>();
+
+    private static readonly IEqualityComparer<object> ReferenceComparer =
+        new RuntimeReferenceComparer();
+
     public static PlayerPrefsDataMgr Instance
     {
-        get
-        {
-            return instance;
-        }
+        get { return InstanceValue; }
     }
+
     private PlayerPrefsDataMgr()
     {
+    }
 
-    }
-    public void SaveData(object data, string keyName)
+    /// <summary>
+    /// 保存对象。一次完整保存结束后只调用一次 PlayerPrefs.Save。
+    /// </summary>
+    public void SaveData(object data, string keyName, bool flush = true)
     {
-        Type dataType = data.GetType();
-        FieldInfo[] infos = dataType.GetFields();
-        string saveKeyName = "";
-        FieldInfo info;
-        for (int i = 0; i < infos.Length; i++)
-        {
-            info = infos[i];
-            saveKeyName = keyName + "_" + dataType.Name + "_" + info.FieldType.Name + "_" + info.Name;
-            info.GetValue(data);
-            SaveValue(info.GetValue(data), saveKeyName);
-        }
+        if (data == null)
+            throw new ArgumentNullException("data");
+
+        if (string.IsNullOrWhiteSpace(keyName))
+            throw new ArgumentException("keyName 不能为空。", "keyName");
+
+        HashSet<object> referencePath =
+            new HashSet<object>(ReferenceComparer);
+
+        SaveValue(data, data.GetType(), keyName, 0, referencePath);
+
+        if (flush)
+            PlayerPrefs.Save();
     }
-    private void SaveValue(object value, string keyName)
-    {
-        Type fieldType = value.GetType();
-        if (fieldType == typeof(int))
-        {
-            PlayerPrefs.SetInt(keyName, (int)value);
-        }
-        else if (fieldType == typeof(float))
-        {
-            PlayerPrefs.SetFloat(keyName, (float)value);
-        }
-        else if (fieldType == typeof(string))
-        {
-            PlayerPrefs.SetString(keyName, value.ToString());
-        }
-        else if (fieldType == typeof(bool))
-        {
-            PlayerPrefs.SetInt(keyName, (bool)value ? 1 : 0);
-        }
-        else if (typeof(IList).IsAssignableFrom(fieldType))
-        {
-            IList list = value as IList;
-            PlayerPrefs.SetInt(keyName, list.Count);
-            int Index = 0;
-            foreach (object obj in list)
-            {
-                SaveValue(obj, keyName + Index);
-                ++Index;
-            }
-        }
-        else if (typeof(IDictionary).IsAssignableFrom(fieldType))
-        {
-            IDictionary dic = value as IDictionary;
-            PlayerPrefs.SetInt(keyName, dic.Count);
-            int index = 0;
-            foreach (object key in dic.Keys)
-            {
-                SaveValue(key, keyName + "_key_" + index);
-                SaveValue(dic[key], keyName + "_value_" + index);
-                ++index;
-            }
-        }
-        else
-        {
-            SaveData(value, keyName);
-        }
-    }
+
+    /// <summary>
+    /// 读取数据；键不存在时返回类型默认对象，兼容原 API。
+    /// 建议优先使用 TryLoadData 判断数据是否存在。
+    /// </summary>
     public object LoadData(Type type, string keyName)
     {
-        object data = Activator.CreateInstance(type);
-        FieldInfo[] infos = type.GetFields();
-        string loadKeyName = "";
-        FieldInfo info;
-        for (int i = 0; i < infos.Length; i++)
-        {
-            info = infos[i];
-            loadKeyName = keyName + "_" + type.Name + "_" + info.FieldType.Name + "_" + info.Name;
-            info.SetValue(data, LoadValue(info.FieldType, loadKeyName));
-        }
-            return data;
-    }
-    private object LoadValue(Type fieldType, string KeyName)
-    {
-        if (fieldType == typeof(int))
-        {
-            return PlayerPrefs.GetInt(KeyName, 0);
-        }
-        else if (fieldType == typeof(float))
-        {
-            return PlayerPrefs.GetFloat(KeyName, 0);
-        }
-        else if (fieldType == typeof(string))
-        {
-            return PlayerPrefs.GetString(KeyName, "");
-        }
-        else if (fieldType == typeof(bool))
-        {
-            return PlayerPrefs.GetInt(KeyName, 0) == 1 ? true : false;
-        }
-        else if (typeof(IList).IsAssignableFrom(fieldType))
-        {
-            int count = PlayerPrefs.GetInt(KeyName, 0);
-            IList list = Activator.CreateInstance(fieldType) as IList;
-            for (int i = 0; i < count; i++)
-            {
-                list.Add(LoadValue(fieldType.GetGenericArguments()[0], KeyName + i));
-            }
-            return list;
-        }
-        else if (typeof(IDictionary).IsAssignableFrom(fieldType))
-        {
-            int count = PlayerPrefs.GetInt(KeyName, 0);
-            IDictionary dic = Activator.CreateInstance(fieldType) as IDictionary;
-            Type[] kvType = fieldType.GetGenericArguments();
-            for (int i = 0; i < count; i++)
-            {
-                dic.Add(LoadValue(kvType[0], KeyName + "_key_" + i), LoadValue(kvType[1], KeyName + "_value_" + i));
+        ValidateLoadArguments(type, keyName);
 
-            }
-            return dic;
-        }
-        else
+        object data;
+        if (TryLoadData(type, keyName, out data))
+            return data;
+
+        return CreateDefaultValue(type);
+    }
+
+    public T LoadData<T>(string keyName)
+    {
+        return (T)LoadData(typeof(T), keyName);
+    }
+
+    public bool TryLoadData(Type type, string keyName, out object data)
+    {
+        ValidateLoadArguments(type, keyName);
+
+        data = null;
+
+        if (!HasStoredValue(keyName))
+            return false;
+
+        data = LoadValue(type, keyName, 0);
+
+        if (data != null)
+            return true;
+
+        // 正常情况下 SaveData 不接受 null 根对象，这里仍兼容显式存储的 null。
+        return PlayerPrefs.GetInt(NullKey(keyName), 0) == 1;
+    }
+
+    public bool TryLoadData<T>(string keyName, out T data)
+    {
+        object value;
+        if (TryLoadData(typeof(T), keyName, out value))
         {
-            return LoadData(fieldType, KeyName);
+            data = (T)value;
+            return true;
+        }
+
+        data = default(T);
+        return false;
+    }
+
+    private void SaveValue(
+        object value,
+        Type declaredType,
+        string key,
+        int depth,
+        HashSet<object> referencePath)
+    {
+        if (depth > MaxDepth)
+            throw new InvalidOperationException("数据嵌套层级过深。");
+
+        if (value == null)
+        {
+            PlayerPrefs.SetInt(NullKey(key), 1);
+            return;
+        }
+
+        Type actualType = value.GetType();
+        Type expectedType = Nullable.GetUnderlyingType(declaredType);
+        if (expectedType == null)
+            expectedType = declaredType;
+
+        ValidateDeclaredType(declaredType, expectedType, actualType);
+
+        if (CanBeNull(declaredType))
+            PlayerPrefs.SetInt(NullKey(key), 0);
+
+        bool trackReference =
+            !actualType.IsValueType && actualType != typeof(string);
+
+        if (trackReference && !referencePath.Add(value))
+        {
+            throw new InvalidOperationException(
+                "检测到循环引用，无法使用 PlayerPrefs 保存引用环。");
+        }
+
+        try
+        {
+            if (actualType == typeof(int))
+            {
+                PlayerPrefs.SetInt(key, (int)value);
+            }
+            else if (actualType == typeof(float))
+            {
+                PlayerPrefs.SetFloat(key, (float)value);
+            }
+            else if (actualType == typeof(string))
+            {
+                PlayerPrefs.SetString(key, (string)value);
+            }
+            else if (actualType == typeof(bool))
+            {
+                PlayerPrefs.SetInt(key, (bool)value ? 1 : 0);
+            }
+            else if (actualType.IsEnum)
+            {
+                PlayerPrefs.SetInt(
+                    key,
+                    Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                IDictionary dictionary = value as IDictionary;
+                if (dictionary != null)
+                {
+                    SaveDictionary(
+                        dictionary,
+                        expectedType,
+                        key,
+                        depth,
+                        referencePath);
+                    return;
+                }
+
+                IList list = value as IList;
+                if (list != null)
+                {
+                    if (actualType.IsArray && actualType.GetArrayRank() != 1)
+                    {
+                        throw new NotSupportedException(
+                            "仅支持一维数组。");
+                    }
+
+                    SaveList(
+                        list,
+                        expectedType,
+                        key,
+                        depth,
+                        referencePath);
+                    return;
+                }
+
+                if (IsUnsupportedScalar(actualType))
+                {
+                    throw new NotSupportedException(
+                        "PlayerPrefs 扩展工具暂不支持类型：" +
+                        actualType.FullName);
+                }
+
+                if (typeof(IEnumerable).IsAssignableFrom(actualType))
+                {
+                    throw new NotSupportedException(
+                        "仅支持一维数组、IList 和 IDictionary 集合，暂不支持：" +
+                        actualType.FullName);
+                }
+
+                SaveObject(
+                    value,
+                    actualType,
+                    key,
+                    depth,
+                    referencePath);
+            }
+        }
+        finally
+        {
+            if (trackReference)
+                referencePath.Remove(value);
+        }
+    }
+
+    private object LoadValue(Type fieldType, string key, int depth)
+    {
+        if (depth > MaxDepth)
+            throw new InvalidOperationException("数据嵌套层级过深。");
+
+        if (CanBeNull(fieldType) &&
+            PlayerPrefs.GetInt(NullKey(key), 0) == 1)
+        {
+            return null;
+        }
+
+        Type nullableType = Nullable.GetUnderlyingType(fieldType);
+        if (nullableType != null)
+        {
+            if (!PlayerPrefs.HasKey(key))
+                return null;
+
+            return LoadValue(nullableType, key, depth);
+        }
+
+        if (fieldType == typeof(int))
+            return PlayerPrefs.GetInt(key, 0);
+
+        if (fieldType == typeof(float))
+            return PlayerPrefs.GetFloat(key, 0f);
+
+        if (fieldType == typeof(string))
+            return PlayerPrefs.GetString(key, string.Empty);
+
+        if (fieldType == typeof(bool))
+            return PlayerPrefs.GetInt(key, 0) != 0;
+
+        if (fieldType.IsEnum)
+        {
+            return Enum.ToObject(
+                fieldType,
+                PlayerPrefs.GetInt(key, 0));
+        }
+
+        Type dictionaryKeyType;
+        Type dictionaryValueType;
+        if (TryGetDictionaryTypes(
+            fieldType,
+            out dictionaryKeyType,
+            out dictionaryValueType))
+        {
+            return LoadDictionary(
+                fieldType,
+                dictionaryKeyType,
+                dictionaryValueType,
+                key,
+                depth);
+        }
+
+        Type listElementType;
+        if (fieldType.IsArray ||
+            TryGetListElementType(fieldType, out listElementType))
+        {
+            return LoadList(fieldType, key, depth);
+        }
+
+        if (fieldType == typeof(object) ||
+            typeof(UnityEngine.Object).IsAssignableFrom(fieldType) ||
+            typeof(Delegate).IsAssignableFrom(fieldType))
+        {
+            throw new NotSupportedException(
+                "不支持读取字段类型：" + fieldType.FullName);
+        }
+
+        if (IsUnsupportedScalar(fieldType))
+        {
+            throw new NotSupportedException(
+                "PlayerPrefs 扩展工具暂不支持类型：" +
+                fieldType.FullName);
+        }
+
+        if (typeof(IEnumerable).IsAssignableFrom(fieldType))
+        {
+            throw new NotSupportedException(
+                "仅支持一维数组、IList 和 IDictionary 集合，暂不支持：" +
+                fieldType.FullName);
+        }
+
+        if (fieldType.IsInterface || fieldType.IsAbstract)
+        {
+            throw new NotSupportedException(
+                "字段类型必须是可实例化的具体类型：" +
+                fieldType.FullName);
+        }
+
+        return LoadObject(fieldType, key, depth + 1);
+    }
+
+    private void SaveObject(
+        object data,
+        Type type,
+        string key,
+        int depth,
+        HashSet<object> referencePath)
+    {
+        PlayerPrefs.SetInt(ObjectKey(key), 1);
+
+        FieldInfo[] fields = GetSerializableFields(type);
+        for (int i = 0; i < fields.Length; i++)
+        {
+            FieldInfo field = fields[i];
+            object value = field.GetValue(data);
+
+            SaveValue(
+                value,
+                field.FieldType,
+                FieldKey(key, field),
+                depth + 1,
+                referencePath);
+        }
+    }
+
+    private object LoadObject(Type type, string key, int depth)
+    {
+        if (!PlayerPrefs.HasKey(ObjectKey(key)))
+        {
+            if (type.IsValueType)
+                return CreateInstance(type);
+
+            return null;
+        }
+
+        object data = CreateInstance(type);
+        FieldInfo[] fields = GetSerializableFields(type);
+
+        for (int i = 0; i < fields.Length; i++)
+        {
+            FieldInfo field = fields[i];
+            object value = LoadValue(
+                field.FieldType,
+                FieldKey(key, field),
+                depth + 1);
+
+            try
+            {
+                field.SetValue(data, value);
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException(
+                    "无法设置字段：" +
+                    type.FullName + "." + field.Name,
+                    exception);
+            }
+        }
+
+        return data;
+    }
+
+    private void SaveList(
+        IList list,
+        Type declaredType,
+        string key,
+        int depth,
+        HashSet<object> referencePath)
+    {
+        Type elementType;
+        if (!TryGetListElementType(declaredType, out elementType))
+        {
+            throw new NotSupportedException(
+                "无法确定列表元素类型：" + declaredType.FullName);
+        }
+
+        PlayerPrefs.SetInt(CountKey(key), list.Count);
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            SaveValue(
+                list[i],
+                elementType,
+                ItemKey(key, i),
+                depth + 1,
+                referencePath);
+        }
+    }
+
+    private object LoadList(Type fieldType, string key, int depth)
+    {
+        if (!PlayerPrefs.HasKey(CountKey(key)))
+            return null;
+
+        int count = PlayerPrefs.GetInt(CountKey(key), 0);
+        ValidateCollectionLength(count, key);
+
+        Type elementType;
+        if (!TryGetListElementType(fieldType, out elementType))
+        {
+            throw new NotSupportedException(
+                "无法确定列表元素类型：" + fieldType.FullName);
+        }
+
+        if (fieldType.IsArray)
+        {
+            if (fieldType.GetArrayRank() != 1)
+                throw new NotSupportedException("仅支持一维数组。");
+
+            Array array = Array.CreateInstance(elementType, count);
+            for (int i = 0; i < count; i++)
+            {
+                object item = LoadValue(
+                    elementType,
+                    ItemKey(key, i),
+                    depth + 1);
+
+                if (item == null && elementType.IsValueType)
+                    item = CreateInstance(elementType);
+
+                array.SetValue(item, i);
+            }
+
+            return array;
+        }
+
+        Type concreteListType = GetConcreteListType(
+            fieldType,
+            elementType);
+        IList list = CreateInstance(concreteListType) as IList;
+
+        if (list == null)
+        {
+            throw new NotSupportedException(
+                "列表类型必须实现非泛型 IList：" +
+                fieldType.FullName);
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            object item = LoadValue(
+                elementType,
+                ItemKey(key, i),
+                depth + 1);
+
+            if (item == null && elementType.IsValueType)
+                item = CreateInstance(elementType);
+
+            list.Add(item);
+        }
+
+        return list;
+    }
+
+    private void SaveDictionary(
+        IDictionary dictionary,
+        Type declaredType,
+        string key,
+        int depth,
+        HashSet<object> referencePath)
+    {
+        Type keyType;
+        Type valueType;
+        if (!TryGetDictionaryTypes(declaredType, out keyType, out valueType))
+        {
+            throw new NotSupportedException(
+                "仅支持泛型字典：" + declaredType.FullName);
+        }
+
+        PlayerPrefs.SetInt(CountKey(key), dictionary.Count);
+
+        int index = 0;
+        foreach (object dictionaryKey in dictionary.Keys)
+        {
+            SaveValue(
+                dictionaryKey,
+                keyType,
+                DictionaryKeyKey(key, index),
+                depth + 1,
+                referencePath);
+
+            SaveValue(
+                dictionary[dictionaryKey],
+                valueType,
+                DictionaryValueKey(key, index),
+                depth + 1,
+                referencePath);
+
+            index++;
+        }
+    }
+
+    private object LoadDictionary(
+        Type fieldType,
+        Type keyType,
+        Type valueType,
+        string key,
+        int depth)
+    {
+        if (!PlayerPrefs.HasKey(CountKey(key)))
+            return null;
+
+        int count = PlayerPrefs.GetInt(CountKey(key), 0);
+        ValidateCollectionLength(count, key);
+
+        Type concreteType = GetConcreteDictionaryType(
+            fieldType,
+            keyType,
+            valueType);
+
+        IDictionary dictionary =
+            CreateInstance(concreteType) as IDictionary;
+
+        if (dictionary == null)
+        {
+            throw new NotSupportedException(
+                "字典类型必须实现非泛型 IDictionary：" +
+                fieldType.FullName);
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            object dictionaryKey = LoadValue(
+                keyType,
+                DictionaryKeyKey(key, i),
+                depth + 1);
+
+            object dictionaryValue = LoadValue(
+                valueType,
+                DictionaryValueKey(key, i),
+                depth + 1);
+
+            if (dictionaryKey == null && keyType.IsValueType)
+                dictionaryKey = CreateInstance(keyType);
+
+            if (dictionaryValue == null && valueType.IsValueType)
+                dictionaryValue = CreateInstance(valueType);
+
+            dictionary.Add(dictionaryKey, dictionaryValue);
+        }
+
+        return dictionary;
+    }
+
+    private static void ValidateDeclaredType(
+        Type declaredType,
+        Type expectedType,
+        Type actualType)
+    {
+        if (typeof(UnityEngine.Object).IsAssignableFrom(actualType))
+        {
+            throw new NotSupportedException(
+                "不支持保存 UnityEngine.Object 引用：" +
+                actualType.FullName);
+        }
+
+        if (typeof(Delegate).IsAssignableFrom(actualType))
+        {
+            throw new NotSupportedException(
+                "不支持保存委托：" + actualType.FullName);
+        }
+
+        if (expectedType == typeof(object))
+        {
+            throw new NotSupportedException(
+                "object 字段无法可靠恢复运行时类型，请声明具体类型。");
+        }
+
+        if (!expectedType.IsAssignableFrom(actualType))
+        {
+            throw new InvalidOperationException(
+                "字段声明类型 " + declaredType.FullName +
+                " 与实际类型 " + actualType.FullName +
+                " 不兼容。");
+        }
+
+        bool isCollection = IsSupportedCollectionType(expectedType);
+
+        if (actualType != expectedType &&
+            !expectedType.IsValueType &&
+            !isCollection)
+        {
+            throw new NotSupportedException(
+                "字段存在多态，当前工具无法可靠恢复：" +
+                declaredType.FullName + " -> " +
+                actualType.FullName);
+        }
+
+        if ((expectedType.IsInterface || expectedType.IsAbstract) &&
+            !isCollection)
+        {
+            throw new NotSupportedException(
+                "仅支持可实例化类型或集合接口：" +
+                expectedType.FullName);
+        }
+    }
+
+    private static bool IsSupportedCollectionType(Type type)
+    {
+        Type keyType;
+        Type valueType;
+
+        if (TryGetDictionaryTypes(type, out keyType, out valueType))
+            return true;
+
+        Type elementType;
+        return type.IsArray ||
+               TryGetListElementType(type, out elementType);
+    }
+
+    private static bool TryGetListElementType(
+        Type type,
+        out Type elementType)
+    {
+        if (type.IsArray)
+        {
+            elementType = type.GetElementType();
+            return elementType != null;
+        }
+
+        Type listInterface = FindGenericInterface(
+            type,
+            typeof(IList<>));
+
+        if (listInterface == null)
+        {
+            elementType = null;
+            return false;
+        }
+
+        elementType = listInterface.GetGenericArguments()[0];
+        return true;
+    }
+
+    private static bool TryGetDictionaryTypes(
+        Type type,
+        out Type keyType,
+        out Type valueType)
+    {
+        Type dictionaryInterface = FindGenericInterface(
+            type,
+            typeof(IDictionary<,>));
+
+        if (dictionaryInterface == null)
+        {
+            keyType = null;
+            valueType = null;
+            return false;
+        }
+
+        Type[] arguments = dictionaryInterface.GetGenericArguments();
+        keyType = arguments[0];
+        valueType = arguments[1];
+        return true;
+    }
+
+    private static Type FindGenericInterface(
+        Type type,
+        Type openGenericInterface)
+    {
+        if (type.IsInterface &&
+            type.IsGenericType &&
+            type.GetGenericTypeDefinition() == openGenericInterface)
+        {
+            return type;
+        }
+
+        Type[] interfaces = type.GetInterfaces();
+        for (int i = 0; i < interfaces.Length; i++)
+        {
+            Type candidate = interfaces[i];
+            if (candidate.IsGenericType &&
+                candidate.GetGenericTypeDefinition() ==
+                openGenericInterface)
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static Type GetConcreteListType(
+        Type declaredType,
+        Type elementType)
+    {
+        if (declaredType.IsInterface || declaredType.IsAbstract)
+            return typeof(List<>).MakeGenericType(elementType);
+
+        if (!typeof(IList).IsAssignableFrom(declaredType))
+        {
+            throw new NotSupportedException(
+                "列表类型必须实现非泛型 IList：" +
+                declaredType.FullName);
+        }
+
+        return declaredType;
+    }
+
+    private static Type GetConcreteDictionaryType(
+        Type declaredType,
+        Type keyType,
+        Type valueType)
+    {
+        if (declaredType.IsInterface || declaredType.IsAbstract)
+        {
+            return typeof(Dictionary<,>).MakeGenericType(
+                keyType,
+                valueType);
+        }
+
+        if (!typeof(IDictionary).IsAssignableFrom(declaredType))
+        {
+            throw new NotSupportedException(
+                "字典类型必须实现非泛型 IDictionary：" +
+                declaredType.FullName);
+        }
+
+        return declaredType;
+    }
+
+    private static object CreateInstance(Type type)
+    {
+        if (type == null)
+            throw new ArgumentNullException("type");
+
+        if (type.IsInterface || type.IsAbstract)
+        {
+            throw new NotSupportedException(
+                "无法创建接口或抽象类型：" + type.FullName);
+        }
+
+        try
+        {
+            object instance = Activator.CreateInstance(type, true);
+            if (instance == null)
+            {
+                throw new InvalidOperationException(
+                    "创建实例返回 null：" + type.FullName);
+            }
+
+            return instance;
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException(
+                "类型必须具有无参构造函数：" + type.FullName,
+                exception);
+        }
+    }
+
+    private static object CreateDefaultValue(Type type)
+    {
+        if (type == typeof(string))
+            return string.Empty;
+
+        if (type.IsArray && type.GetArrayRank() == 1)
+            return Array.CreateInstance(type.GetElementType(), 0);
+
+        Type keyType;
+        Type valueType;
+        if (TryGetDictionaryTypes(type, out keyType, out valueType))
+        {
+            return CreateInstance(
+                GetConcreteDictionaryType(
+                    type,
+                    keyType,
+                    valueType));
+        }
+
+        Type elementType;
+        if (TryGetListElementType(type, out elementType))
+        {
+            return CreateInstance(
+                GetConcreteListType(type, elementType));
+        }
+
+        if (type.IsInterface || type.IsAbstract)
+            return null;
+
+        return CreateInstance(type);
+    }
+
+    private static FieldInfo[] GetSerializableFields(Type type)
+    {
+        lock (FieldCache)
+        {
+            FieldInfo[] cachedFields;
+            if (FieldCache.TryGetValue(type, out cachedFields))
+                return cachedFields;
+
+            List<FieldInfo> fields = new List<FieldInfo>();
+            HashSet<string> names =
+                new HashSet<string>(StringComparer.Ordinal);
+
+            Type currentType = type;
+            while (currentType != null &&
+                   currentType != typeof(object) &&
+                   currentType != typeof(ValueType))
+            {
+                FieldInfo[] declaredFields = currentType.GetFields(
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+
+                for (int i = 0; i < declaredFields.Length; i++)
+                {
+                    FieldInfo field = declaredFields[i];
+
+                    if (field.IsStatic ||
+                        field.IsLiteral ||
+                        field.IsInitOnly ||
+                        field.IsNotSerialized)
+                    {
+                        continue;
+                    }
+
+                    bool serializeField =
+                        field.IsDefined(
+                            typeof(SerializeField),
+                            true);
+
+                    if (!field.IsPublic && !serializeField)
+                        continue;
+
+                    if (!names.Add(field.Name))
+                    {
+                        throw new NotSupportedException(
+                            "类型存在同名隐藏字段：" +
+                            type.FullName + "." + field.Name);
+                    }
+
+                    fields.Add(field);
+                }
+
+                currentType = currentType.BaseType;
+            }
+
+            fields.Sort(delegate(FieldInfo left, FieldInfo right)
+            {
+                return string.CompareOrdinal(left.Name, right.Name);
+            });
+
+            cachedFields = fields.ToArray();
+            FieldCache.Add(type, cachedFields);
+            return cachedFields;
+        }
+    }
+
+    private static bool CanBeNull(Type type)
+    {
+        return !type.IsValueType ||
+               Nullable.GetUnderlyingType(type) != null;
+    }
+
+    private static bool IsUnsupportedScalar(Type type)
+    {
+        if (type.IsPrimitive)
+        {
+            return type != typeof(int) &&
+                   type != typeof(float) &&
+                   type != typeof(bool);
+        }
+
+        return type == typeof(decimal) ||
+               type == typeof(DateTime) ||
+               type == typeof(DateTimeOffset) ||
+               type == typeof(TimeSpan) ||
+               type == typeof(Guid) ||
+               type == typeof(Type);
+    }
+
+    private static bool HasStoredValue(string key)
+    {
+        if (PlayerPrefs.HasKey(key) ||
+            PlayerPrefs.HasKey(ObjectKey(key)) ||
+            PlayerPrefs.HasKey(CountKey(key)))
+        {
+            return true;
+        }
+
+        return PlayerPrefs.HasKey(NullKey(key)) &&
+               PlayerPrefs.GetInt(NullKey(key), 0) == 1;
+    }
+
+    private static void ValidateLoadArguments(
+        Type type,
+        string keyName)
+    {
+        if (type == null)
+            throw new ArgumentNullException("type");
+
+        if (string.IsNullOrWhiteSpace(keyName))
+            throw new ArgumentException("keyName 不能为空。", "keyName");
+    }
+
+    private static void ValidateCollectionLength(
+        int count,
+        string key)
+    {
+        if (count < 0 || count > MaxCollectionLength)
+        {
+            throw new InvalidOperationException(
+                "集合长度异常，key = " + key +
+                ", count = " + count);
+        }
+    }
+
+    private static string FieldKey(string key, FieldInfo field)
+    {
+        return key + "." + field.Name;
+    }
+
+    private static string ItemKey(string key, int index)
+    {
+        return key + "[" + index.ToString(
+            System.Globalization.CultureInfo.InvariantCulture) + "]";
+    }
+
+    private static string DictionaryKeyKey(string key, int index)
+    {
+        return key + "$key[" + index.ToString(
+            System.Globalization.CultureInfo.InvariantCulture) + "]";
+    }
+
+    private static string DictionaryValueKey(string key, int index)
+    {
+        return key + "$value[" + index.ToString(
+            System.Globalization.CultureInfo.InvariantCulture) + "]";
+    }
+
+    private static string CountKey(string key)
+    {
+        return key + CountSuffix;
+    }
+
+    private static string NullKey(string key)
+    {
+        return key + NullSuffix;
+    }
+
+    private static string ObjectKey(string key)
+    {
+        return key + ObjectSuffix;
+    }
+
+    private sealed class RuntimeReferenceComparer :
+        IEqualityComparer<object>
+    {
+        public bool Equals(object left, object right)
+        {
+            return ReferenceEquals(left, right);
+        }
+
+        public int GetHashCode(object value)
+        {
+            return RuntimeHelpers.GetHashCode(value);
         }
     }
 }
